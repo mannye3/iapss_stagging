@@ -1,8 +1,9 @@
 import bcrypt from 'bcryptjs';
-import { db } from '../connect.js';
+import { db, query } from '../connect.js';
 import transporter from '../config/nodemailer.js';
 import jwt from "jsonwebtoken"
 import ErrorResponse from '../middlewares/errorMiddleware.js'; // ✅ Correct import
+import { sendEmail } from '../services/emailService.js';
 
 
 
@@ -16,79 +17,153 @@ const generateRandomPassword = (length = 8) => {
     return password;
 };
 
-export const onboardUser = (req, res) => {
-    const { name, email, role } = req.body;
-    const user_type = 'internal'
 
-    // Validate request body
-    if (!name || !email || !role) {
-        return res.status(400).json({ error: 'All fields are required and role must be a string' });
-    }
+export const onboardUser = async (req, res, next) => {
+    try {
+        const { name, email, role, authorizer_id } = req.body;
+        const inputter_id = req.user?.id;
+        const inputter_date = new Date();
+        const user_type = 'internal';
 
-    // Generate a random password (8 characters by default)
-    const password = generateRandomPassword(8);
-
-    // Check if email already exists in the database
-    const queryCheckUser = "SELECT * FROM users WHERE email = ?";
-    db.query(queryCheckUser, [email], (err, data) => {
-        if (err) return res.status(500).json(err);
-        if (data.length > 0) {
-            return res.status(409).json({ error: 'User already exists' });
+        if (!name || !email || !role || !authorizer_id) {
+            return res.status(400).json({ error: "Missing required fields." });
         }
 
-        // Hash the generated password using bcrypt
-        const salt = bcrypt.genSaltSync(10);
-        const hashedPassword = bcrypt.hashSync(password, salt);
+        // Check if user already exists in users table
+        const [existingUser] = await query(
+            "SELECT id FROM users WHERE email = ?",
+            [email]
+        );
 
-        // Store the hashed password and email in the database
-        const queryInsertUser = "INSERT INTO users (`name`, `email`, `password`, `password_changed`) VALUES (?, ?, ?, ?)";
-        db.query(queryInsertUser, [name, email, hashedPassword, false], (err, result) => {
-            if (err) return res.status(500).json(err);
-
-            const userId = result.insertId;
-
-            // Insert single role
-            const queryInsertRole = "INSERT INTO user_roles (user_id, role_id) VALUES (?, (SELECT id FROM roles WHERE name = ?))";
-            db.query(queryInsertRole, [userId, role], (err) => {
-                if (err) return res.status(500).json(err);
-
-                // Generate reset token for the newly onboarded user
-                const token = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1h' });
-
-                // Insert the token into password_reset_tokens table
-                const insertTokenQuery = "INSERT INTO password_reset_tokens (user_id, token) VALUES (?, ?)";
-                db.query(insertTokenQuery, [userId, token], (err) => {
-                    if (err) return res.status(500).json(err);
-
-                    // Define the reset password URL
-                    const CLIENT_URL = 'https://adgtest.fmdqgroup.com/iapss';
-                    const resetLink = `${CLIENT_URL}/reset-password/${token}`;
-
-                    // Send email with login details  
-                    const mailOptions = {
-                        from: process.env.EMAIL,
-                        to: email,
-                        subject: 'Your Account Details',
-                        text: `Hello ${name},\n\nYour account has been created.\n\nLogin Details:\nEmail: ${email}\nPassword: ${password}\n\nYou can click the link below to change your password after your first login:\n\n${resetLink}\n\nBest regards,\nAdmin Team`
-                    };
-
-                    // Send the email with the reset link
-                    transporter.sendMail(mailOptions, (error, info) => {
-                        if (error) {
-                            return res.status(500).json({ error: 'Error sending email', details: error });
-                        }
-
-                        res.status(200).json({
-                            message: 'User onboarded successfully and password reset link sent',
-                            success: true,
-                            status: 200
-                        });
-                    });
-                });
+        if (existingUser) {
+            return res.status(400).json({
+                error: "User with this email already exists"
             });
+        }
+
+        // Check if there's a pending request for this email
+        const [pendingRequest] = await query(
+            "SELECT id FROM pending_users WHERE email = ? AND status = 'pending'",
+            [email]
+        );
+
+        if (pendingRequest) {
+            return res.status(400).json({
+                error: "There is already a pending request for this email"
+            });
+        }
+
+
+
+        // Insert into users table and get the inserted user ID
+        const insertUserQuery = `
+            INSERT INTO users (name, email, user_type)
+            VALUES (?, ?, ?)
+        `;
+        const userResult = await query(insertUserQuery, [name, email, 'internal']);
+
+        const user_id = userResult.insertId; // Get the generated user ID
+
+        // Insert into pending_users table with the obtained user_id
+        const insertPendingUserQuery = `
+            INSERT INTO pending_users (user_id, name, email, role, inputter_id, inputter_date, action_type, user_type, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'insert', 'internal', 'pending')
+        `;
+        await query(insertPendingUserQuery, [user_id, name, email, role, inputter_id, inputter_date]);
+
+        // Send email to authorizer
+        const authorizerQuery = `SELECT email FROM users WHERE id = ?`;
+        const [authorizer] = await query(authorizerQuery, [authorizer_id]);
+
+        if (authorizer) {
+            const subject = "Approval Required: New User Onboarding";
+            const emailBody = `You have been selected as the authorizer for ${name}'s onboarding. Please review the request.`;
+            await sendEmail(authorizer.email, subject, emailBody);
+        }
+
+        res.json({
+            message: "User onboarding request sent for approval.", status: 200,
+            success: true, user_id
         });
-    });
+    } catch (error) {
+        next(error);
+    }
 };
+
+
+// export const onboardUser = (req, res) => {
+//     const { name, email, role } = req.body;
+//     const user_type = 'internal'
+
+//     // Validate request body
+//     if (!name || !email || !role) {
+//         return res.status(400).json({ error: 'All fields are required and role must be a string' });
+//     }
+
+//     // Generate a random password (8 characters by default)
+//     const password = generateRandomPassword(8);
+
+//     // Check if email already exists in the database
+//     const queryCheckUser = "SELECT * FROM users WHERE email = ?";
+//     db.query(queryCheckUser, [email], (err, data) => {
+//         if (err) return res.status(500).json(err);
+//         if (data.length > 0) {
+//             return res.status(409).json({ error: 'User already exists' });
+//         }
+
+//         // Hash the generated password using bcrypt
+//         const salt = bcrypt.genSaltSync(10);
+//         const hashedPassword = bcrypt.hashSync(password, salt);
+
+//         // Store the hashed password and email in the database
+//         const queryInsertUser = "INSERT INTO users (`name`, `email`, `password`, `password_changed`) VALUES (?, ?, ?, ?)";
+//         db.query(queryInsertUser, [name, email, hashedPassword, false], (err, result) => {
+//             if (err) return res.status(500).json(err);
+
+//             const userId = result.insertId;
+
+//             // Insert single role
+//             const queryInsertRole = "INSERT INTO user_roles (user_id, role_id) VALUES (?, (SELECT id FROM roles WHERE name = ?))";
+//             db.query(queryInsertRole, [userId, role], (err) => {
+//                 if (err) return res.status(500).json(err);
+
+//                 // Generate reset token for the newly onboarded user
+//                 const token = jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1h' });
+
+//                 // Insert the token into password_reset_tokens table
+//                 const insertTokenQuery = "INSERT INTO password_reset_tokens (user_id, token) VALUES (?, ?)";
+//                 db.query(insertTokenQuery, [userId, token], (err) => {
+//                     if (err) return res.status(500).json(err);
+
+//                     // Define the reset password URL
+//                     const CLIENT_URL = 'https://adgtest.fmdqgroup.com/iapss';
+//                     const resetLink = `${CLIENT_URL}/reset-password/${token}`;
+
+//                     // Send email with login details  
+//                     const mailOptions = {
+//                         from: process.env.EMAIL,
+//                         to: email,
+//                         subject: 'Your Account Details',
+//                         text: `Hello ${name},\n\nYour account has been created.\n\nLogin Details:\nEmail: ${email}\nPassword: ${password}\n\nYou can click the link below to change your password after your first login:\n\n${resetLink}\n\nBest regards,\nAdmin Team`
+//                     };
+
+//                     // Send the email with the reset link
+//                     transporter.sendMail(mailOptions, (error, info) => {
+//                         if (error) {
+//                             return res.status(500).json({ error: 'Error sending email', details: error });
+//                         }
+
+//                         res.status(200).json({
+//                             message: 'User onboarded successfully and password reset link sent',
+//                             success: true,
+//                             status: 200
+//                         });
+//                     });
+//                 });
+//             });
+//         });
+//     });
+// };
 
 export const onboardExternalUser = async (req, res, next) => {
     try {

@@ -1,10 +1,11 @@
-import { db } from './../connect.js';
+import { db, query } from '../connect.js';
 import bcrypt from "bcryptjs"
 import jwt from "jsonwebtoken"
 import nodemailer from 'nodemailer';
 import { v4 as uuidv4 } from 'uuid';
 import ErrorResponse from '../middlewares/errorMiddleware.js';
 const secretKey = process.env.JWT_SECRET; // Use the secret key from environment variables
+
 
 
 
@@ -63,67 +64,105 @@ export const register = (req, res) => {
 
 export const login = async (req, res, next) => {
     try {
-        // Validate request body
-        if (!req.body.email || !req.body.password) {
+        const { email, password } = req.body;
+
+        // Validate input
+        if (!email || !password) {
             return next(new ErrorResponse('Email and password are required', 400));
         }
 
-        // Check if the user exists and is active in the database
-        const checkUserQuery = `
-            SELECT u.id, u.name, u.email, u.password, u.is_active, u.institution 
-            FROM users u 
-            WHERE u.email = ?
-        `;
+        // Get user data
+        const userResults = await query(
+            `SELECT id, name, email, password, is_active, failed_attempts, lock_until, institution, password_last_changed 
+             FROM users WHERE email = ?`,
+            [email]
+        );
 
-        // Using promisify to handle the database query with async/await
-        const [userData] = await new Promise((resolve, reject) => {
-            db.query(checkUserQuery, [req.body.email], (err, result) => {
-                if (err) {
-                    console.error('Database Query Error:', err);
-                    reject(new ErrorResponse(`Database query failed: ${err.message}`, 500));
-                }
-                resolve(result);
-            });
-        });
+        const userData = userResults[0];
 
+        // Always do bcrypt compare even if user not found (to prevent timing attacks)
         if (!userData) {
+            await bcrypt.compare(password, '$2b$10$abcdefghijklmnopqrstuv'); // dummy hash
             return next(new ErrorResponse('Invalid email or password', 401));
         }
 
-        // Check if account is active
+        // Check account status
         if (!userData.is_active) {
-            return next(new ErrorResponse('Account is inactive. Please contact administrator', 403));
+            return next(new ErrorResponse('Account is inactive. Please contact administrator.', 403));
         }
 
-        // Compare the password with the hashed password in the database
-        const isPasswordValid = await bcrypt.compare(req.body.password, userData.password);
+        if (userData.lock_until && new Date() < new Date(userData.lock_until)) {
+            return next(new ErrorResponse('Account locked. Try again later.', 403));
+        }
+
+        // Check password
+        const isPasswordValid = await bcrypt.compare(password, userData.password);
         if (!isPasswordValid) {
+            const updatedAttempts = userData.failed_attempts + 1;
+
+            await query(
+                'UPDATE users SET failed_attempts = ? WHERE id = ?',
+                [updatedAttempts, userData.id]
+            );
+
+            if (updatedAttempts >= 3) {
+                const lockUntil = new Date();
+                lockUntil.setMinutes(lockUntil.getMinutes() + 5);
+
+                await query(
+                    'UPDATE users SET lock_until = ? WHERE id = ?',
+                    [lockUntil, userData.id]
+                );
+
+                return res.status(403).json({
+                    status: 403,
+                    message: 'Account locked. Please reset your password.',
+                    email: userData.email,
+                    isLocked: true
+                });
+            }
+
             return next(new ErrorResponse('Invalid email or password', 401));
         }
 
-        // Fetch user's role
-        const getUserRoleQuery = `
-            SELECT roles.name AS role 
-            FROM user_roles 
-            JOIN roles ON user_roles.role_id = roles.id 
-            WHERE user_roles.user_id = ?
-        `;
+        // Reset failed attempts
+        await query(
+            'UPDATE users SET failed_attempts = 0, lock_until = NULL WHERE id = ?',
+            [userData.id]
+        );
 
-        const roleData = await new Promise((resolve, reject) => {
-            db.query(getUserRoleQuery, [userData.id], (err, result) => {
-                if (err) {
-                    console.error('Role Query Error:', err);
-                    reject(new ErrorResponse(`Error fetching user role: ${err.message}`, 500));
-                }
-                resolve(result);
-            });
-        });
+        // Force password change on first login
+        if (!userData.password_last_changed) {
+            return next(new ErrorResponse('First login detected. Change your password.', 403));
+        }
 
-        const role = roleData.length > 0 ? roleData[0].role : 'No Role Assigned';
+        // Enforce password expiration after 30 days
+        const lastChanged = new Date(userData.password_last_changed);
+        const now = new Date();
+        const daysSinceChange = (now - lastChanged) / (1000 * 60 * 60 * 24);
+        if (daysSinceChange > 30) {
+            return next(new ErrorResponse('Password expired. Please reset your password.', 403));
+        }
 
-        // Generate a JWT token
+        // Get user role
+        const roleResults = await query(
+            `SELECT roles.name AS role 
+             FROM user_roles 
+             JOIN roles ON user_roles.role_id = roles.id 
+             WHERE user_roles.user_id = ?`,
+            [userData.id]
+        );
+
+        const role = roleResults.length > 0 ? roleResults[0].role : 'No Role Assigned';
+
+        // Generate token
         const token = jwt.sign(
-            { id: userData.id, name: userData.name, email: userData.email, institution_id: userData.institution, role },
+            {
+                id: userData.id,
+                name: userData.name,
+                email: userData.email,
+                role
+            },
             process.env.JWT_SECRET,
             { expiresIn: '1h' }
         );
@@ -135,7 +174,6 @@ export const login = async (req, res, next) => {
             token,
             user: {
                 id: userData.id,
-                institution_id: userData.institution,
                 email: userData.email,
                 name: userData.name,
                 role
@@ -143,7 +181,6 @@ export const login = async (req, res, next) => {
         });
 
     } catch (error) {
-        console.error('Login Error:', error);
         return next(error);
     }
 };
@@ -223,73 +260,97 @@ export const resetPassword = async (req, res, next) => {
     try {
         const { newPassword } = req.body;
         const token = req.params.token;
+        const password_changed = new Date();
 
         if (!token || !newPassword) {
             return next(new ErrorResponse('Token and new password are required', 400));
         }
 
-        const verifyTokenQuery = "SELECT * FROM password_reset_tokens WHERE token = ?";
+        // Ensure password meets complexity requirements
+        const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,128}$/;
+        if (!passwordRegex.test(newPassword)) {
+            return next(new ErrorResponse('Password must be 8-128 characters, include uppercase, lowercase, number, and special character', 400));
+        }
+
+        // Verify the token
+        const verifyTokenQuery = "SELECT * FROM password_reset_tokens WHERE token = ? AND used = FALSE";
         const [tokenData] = await new Promise((resolve, reject) => {
             db.query(verifyTokenQuery, [token], (err, data) => {
-                if (err) {
-                    console.error('Token Verification Error:', err);
-                    reject(new ErrorResponse(`Database query failed: ${err.message}`, 500));
-                }
+                if (err) reject(new ErrorResponse(`Database query failed: ${err.message}`, 500));
                 resolve(data);
             });
         });
 
-        if (!tokenData || tokenData.used) {
+        if (!tokenData) {
             return next(new ErrorResponse('Invalid or expired token', 400));
         }
 
-        // Verify JWT token
+        // Decode the JWT token
         const decoded = await new Promise((resolve, reject) => {
             jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-                if (err) {
-                    reject(new ErrorResponse('Invalid or expired token', 400));
-                }
+                if (err) reject(new ErrorResponse('Invalid or expired token', 400));
                 resolve(decoded);
             });
         });
 
         const userId = decoded.id;
+
+        // Fetch the last 10 passwords of the user
+        const fetchOldPasswordsQuery = "SELECT old_password_hash FROM user_password_history WHERE user_id = ? ORDER BY created_at  DESC LIMIT 10";
+        const oldPasswords = await new Promise((resolve, reject) => {
+            db.query(fetchOldPasswordsQuery, [userId], (err, data) => {
+                if (err) reject(new ErrorResponse(`Error fetching old passwords: ${err.message}`, 500));
+                resolve(data);
+            });
+        });
+
+        // Check if the new password was used before
+        const isReusedPassword = oldPasswords.some(({ old_password_hash }) => bcrypt.compareSync(newPassword, old_password_hash));
+        if (isReusedPassword) {
+            return next(new ErrorResponse('Cannot reuse the last 10 passwords', 400));
+        }
+
+        // Hash the new password
         const salt = bcrypt.genSaltSync(10);
         const hashedPassword = bcrypt.hashSync(newPassword, salt);
 
-        // Update password
-        const updatePasswordQuery = "UPDATE users SET password = ? WHERE id = ?";
+        // Update user password
+        const updatePasswordQuery = "UPDATE users SET password = ?, password_last_changed = ?, failed_attempts = 0, lock_until = NULL  WHERE id = ?";
         await new Promise((resolve, reject) => {
-            db.query(updatePasswordQuery, [hashedPassword, userId], (err) => {
-                if (err) {
-                    console.error('Password Update Error:', err);
-                    reject(new ErrorResponse(`Error updating password: ${err.message}`, 500));
-                }
+            db.query(updatePasswordQuery, [hashedPassword, password_changed, userId], (err) => {
+                if (err) reject(new ErrorResponse(`Error updating password: ${err.message}`, 500));
                 resolve();
             });
         });
 
-        // Mark token as used
+        // Store old password in history
+        const insertPasswordHistoryQuery = "INSERT INTO user_password_history (user_id, old_password_hash) VALUES (?, ?)";
+        await new Promise((resolve, reject) => {
+            db.query(insertPasswordHistoryQuery, [userId, hashedPassword], (err) => {
+                if (err) reject(new ErrorResponse(`Error saving password history: ${err.message}`, 500));
+                resolve();
+            });
+        });
+
+        // Mark reset token as used
         const markTokenUsedQuery = "UPDATE password_reset_tokens SET used = TRUE WHERE token = ?";
         await new Promise((resolve, reject) => {
             db.query(markTokenUsedQuery, [token], (err) => {
-                if (err) {
-                    console.error('Token Update Error:', err);
-                    reject(new ErrorResponse(`Error updating token status: ${err.message}`, 500));
-                }
+                if (err) reject(new ErrorResponse(`Error updating token status: ${err.message}`, 500));
                 resolve();
             });
         });
 
         res.status(200).json({
             success: true,
-            message: 'Password reset successful'
+            message: 'Password reset successful',
         });
 
     } catch (error) {
         next(error);
     }
 };
+
 
 
 
