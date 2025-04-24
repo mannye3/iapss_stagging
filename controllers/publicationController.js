@@ -497,7 +497,8 @@ export const getAllApprovedPublications = async (req, res, next) => {
                 p.title, 
                 p.user_id, 
                 u.name AS user_name,
-                p.publication_doc, 
+                p.publication_doc,
+                p.content,
                 p.status, 
                 p.created_at,
                 i.name AS institution_name
@@ -535,7 +536,8 @@ export const getAllPublications = async (req, res, next) => {
                 p.publication_doc, 
                 p.status, 
                 p.created_at,
-                i.name AS institution_name
+                i.name AS institution_name,
+                i.id AS institution_id
             FROM publications p
             LEFT JOIN institutions i ON p.institution_id = i.id
             LEFT JOIN users u ON p.user_id = u.id

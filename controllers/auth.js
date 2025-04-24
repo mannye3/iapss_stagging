@@ -73,8 +73,8 @@ export const login = async (req, res, next) => {
 
         // Get user data
         const userResults = await query(
-            `SELECT id, name, email, password, is_active, failed_attempts, lock_until, institution, password_last_changed 
-             FROM users WHERE email = ?`,
+            `SELECT users.id, users.name, users.email, users.password, users.is_active, users.failed_attempts, users.lock_until, users.institution, i.logo, users.password_last_changed 
+             FROM users LEFT JOIN institutions i ON users.institution = i.id WHERE email = ?`,
             [email]
         );
 
@@ -98,7 +98,7 @@ export const login = async (req, res, next) => {
         // Check password
         const isPasswordValid = await bcrypt.compare(password, userData.password);
         if (!isPasswordValid) {
-            const updatedAttempts = userData.failed_attempts + 1;
+            const updatedAttempts = userData.failed_attempts + 3;
 
             await query(
                 'UPDATE users SET failed_attempts = ? WHERE id = ?',
@@ -176,6 +176,7 @@ export const login = async (req, res, next) => {
                 id: userData.id,
                 email: userData.email,
                 name: userData.name,
+                logo: userData.logo,
                 role
             }
         });
